@@ -1,0 +1,51 @@
+[project]
+name = "swipevault-backend"
+version = "0.1.0"
+description = "SwipeVault API and worker: private affiliate email swipe library"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.32.1",
+  "pydantic==2.10.3",
+  "pydantic-settings==2.6.1",
+  "email-validator==2.2.0",
+  "SQLAlchemy==2.0.36",
+  "alembic==1.14.0",
+  "psycopg[binary]==3.2.3",
+  "redis==5.2.1",
+  "rq==2.0.0",
+  "httpx==0.28.1",
+  "beautifulsoup4==4.12.3",
+  "PyMuPDF==1.25.1",
+  "python-docx==1.1.2",
+  "argon2-cffi==23.1.0",
+  "nh3==0.2.19",
+  "python-multipart==0.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "ruff==0.8.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 115
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101", "B008", "S311"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108"]
+"alembic/*" = ["E501"]

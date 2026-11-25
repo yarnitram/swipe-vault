@@ -1,0 +1,6 @@
+network,external_offer_id,title,niche,vendor_name,offer_url,affiliate_resources_url,notes
+clickbank,metaboost1,MetaBoost Metabolic Flush,Health & Fitness,MetaBoost Wellness,https://metaboost.example.com/offer,https://metaboost.example.com/affiliates,Approved vendor swipe pack
+clickbank,jointflex9,JointFlex Mobility Protocol,Health & Fitness,JointFlex Labs,https://jointflex.example.com/offer,https://jointflex.example.com/jv,Requires hop link placeholder
+clickbank,metaboost1,Duplicate External ID Row,Health & Fitness,MetaBoost Wellness,https://metaboost.example.com/dup,,Duplicate in file check
+unknownnet,badnet1,Invalid Network Offer,Health & Fitness,Unknown Co,https://badnet.example.com,,Should fail validation
+clickbank,ssrf1,Blocked SSRF URL Offer,Health & Fitness,Bad Host,http://127.0.0.1/admin,,Should fail SSRF validation

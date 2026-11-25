@@ -1,0 +1,123 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-swipevault}
+      POSTGRES_USER: ${POSTGRES_USER:-swipevault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-swipevault_dev_only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-swipevault} -d ${POSTGRES_DB:-swipevault}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:2100}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://swipevault:swipevault_dev_only@postgres:5432/swipevault}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-swipevault}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-insecure-session-secret-change-me}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      ASSET_STORAGE_PATH: /data/assets
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@swipevault.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe-SwipeVault-2026!}
+      CRAWL_DELAY_SECONDS: ${CRAWL_DELAY_SECONDS:-2}
+      CRAWL_MAX_PAGES: ${CRAWL_MAX_PAGES:-30}
+      CRAWL_MAX_DEPTH: ${CRAWL_MAX_DEPTH:-2}
+      DOWNLOAD_MAX_BYTES: ${DOWNLOAD_MAX_BYTES:-26214400}
+      LISTMONK_ENABLED: ${LISTMONK_ENABLED:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-none}
+    volumes:
+      - asset_data:/data/assets
+      - ./fixtures:/app/fixtures:ro
+      - ./backend/app:/app/app:ro
+      - ./backend/tests:/app/tests:ro
+      - ./backend/pyproject.toml:/app/pyproject.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.tasks"]
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://swipevault:swipevault_dev_only@postgres:5432/swipevault}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:-swipevault}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-insecure-session-secret-change-me}
+      ASSET_STORAGE_PATH: /data/assets
+      CRAWL_DELAY_SECONDS: ${CRAWL_DELAY_SECONDS:-2}
+      CRAWL_MAX_PAGES: ${CRAWL_MAX_PAGES:-30}
+      CRAWL_MAX_DEPTH: ${CRAWL_MAX_DEPTH:-2}
+      DOWNLOAD_MAX_BYTES: ${DOWNLOAD_MAX_BYTES:-26214400}
+    volumes:
+      - asset_data:/data/assets
+      - ./fixtures:/app/fixtures:ro
+      - ./backend/app:/app/app:ro
+      - ./backend/tests:/app/tests:ro
+      - ./backend/pyproject.toml:/app/pyproject.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-2100}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
+  asset_data:
