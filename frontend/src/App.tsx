@@ -9,6 +9,8 @@ import OfferDetailPage from './pages/OfferDetailPage';
 import SwipeLibraryPage from './pages/SwipeLibraryPage';
 import SwipeDetailPage from './pages/SwipeDetailPage';
 import ReviewQueuePage from './pages/ReviewQueuePage';
+import DraftsPage from './pages/DraftsPage';
+import DraftDetailPage from './pages/DraftDetailPage';
 import JobsPage from './pages/JobsPage';
 import JobDetailPage from './pages/JobDetailPage';
 import SettingsPage from './pages/SettingsPage';
@@ -48,6 +50,8 @@ export default function App() {
         <Route path="swipes" element={<SwipeLibraryPage />} />
         <Route path="swipes/:id" element={<SwipeDetailPage />} />
         <Route path="review" element={<ReviewQueuePage />} />
+        <Route path="drafts" element={<DraftsPage />} />
+        <Route path="drafts/:id" element={<DraftDetailPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="jobs/:id" element={<JobDetailPage />} />
         <Route path="settings" element={<SettingsPage />} />

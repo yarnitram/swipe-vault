@@ -45,9 +45,10 @@ def clean_database() -> Iterator[None]:
     with session_factory() as db:
         db.execute(
             text(
-                "TRUNCATE TABLE audit_events, job_events, jobs, review_events, swipe_tags, tags, "
-                "swipe_provenance, subject_variants, swipe_versions, swipes, asset_sources, assets, "
-                "sources, offer_approvals, offers, sessions RESTART IDENTITY CASCADE"
+                "TRUNCATE TABLE exports, drafts, audit_events, job_events, jobs, review_events, "
+                "swipe_tags, tags, swipe_provenance, subject_variants, swipe_versions, swipes, "
+                "asset_sources, assets, sources, offer_approvals, offers, sessions "
+                "RESTART IDENTITY CASCADE"
             )
         )
         db.commit()

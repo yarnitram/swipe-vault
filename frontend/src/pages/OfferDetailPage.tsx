@@ -4,14 +4,18 @@ import { api, ApiError, assetDownloadUrl, errorMessage } from '../api/client';
 import {
   ACCESS_STATES,
   APPROVAL_STATES,
+  NON_SCANNABLE_ACCESS_STATES,
   SOURCE_TYPES,
   type AccessState,
   type ApprovalState,
+  type JobDetail,
   type Offer,
+  type Source,
   type SourceType,
 } from '../api/types';
 import { useToast } from '../components/Toast';
 import {
+  AccessStateBadge,
   ApprovalBadge,
   Badge,
   ConfidenceBadge,
@@ -21,14 +25,24 @@ import {
   Field,
   FlagBadge,
   JobStateBadge,
+  KeyValue,
+  Modal,
   PageHeader,
   ReviewBadge,
   Section,
   Spinner,
 } from '../components/ui';
-import { formatBytes, formatDateTime } from '../lib/format';
+import { formatBytes, formatDateTime, parseTags } from '../lib/format';
 import { useAsync } from '../lib/useAsync';
 import { useJobPoller } from '../lib/useJobPoller';
+
+export function extractDomain(urlStr: string): string {
+  try {
+    return new URL(urlStr).hostname;
+  } catch {
+    return urlStr;
+  }
+}
 
 export default function OfferDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
@@ -40,20 +54,22 @@ export default function OfferDetailPage() {
   const assets = useAsync(() => api.listAssets(id), [id]);
   const swipes = useAsync(() => api.listSwipes({ offer_id: id, page: 1, page_size: 50 }), [id]);
 
-  // Active upload job being polled
+  // Active upload or source-scan job being polled
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const { job: activeJob, error: pollError } = useJobPoller(activeJobId, (finishedJob) => {
+    sources.reload();
     assets.reload();
     swipes.reload();
     offer.reload();
+    const label = finishedJob.type === 'scan_source' ? 'Resource scan' : 'Ingest';
     if (finishedJob.state === 'completed') {
       toast.success(
-        `Ingest completed: ${finishedJob.progress.swipes_new} new swipe(s), ${finishedJob.progress.duplicates} duplicate(s).`,
+        `${label} completed: ${finishedJob.progress.swipes_new} new swipe(s), ${finishedJob.progress.duplicates} duplicate(s).`,
       );
     } else if (finishedJob.state === 'partial') {
-      toast.info(`Ingest finished with warnings (${finishedJob.progress.warnings}).`);
+      toast.info(`${label} finished with warnings (${finishedJob.progress.warnings}).`);
     } else if (finishedJob.state === 'failed') {
-      toast.error(finishedJob.error_summary || 'Ingest job failed.');
+      toast.error(finishedJob.error_summary || `${label} job failed.`);
     }
   });
 
@@ -114,10 +130,16 @@ export default function OfferDetailPage() {
         sources={sources.data ?? []}
         loading={sources.loading && !sources.data}
         error={sources.error}
+        activeJob={activeJob}
+        pollError={pollError}
         onRetry={sources.reload}
         onChanged={() => {
           sources.reload();
           offer.reload();
+        }}
+        onScanStarted={(jobId) => {
+          setActiveJobId(jobId);
+          toast.info('Permission-aware source scan started.');
         }}
       />
 
@@ -144,8 +166,8 @@ export default function OfferDetailPage() {
         ) : assets.error ? (
           <ErrorState message={assets.error} onRetry={assets.reload} />
         ) : !assets.data || assets.data.length === 0 ? (
-          <EmptyState title="No assets uploaded yet">
-            Upload an authorized TXT, HTML, PDF, DOCX, or ZIP file above to extract email swipes.
+          <EmptyState title="No assets uploaded or scanned yet">
+            Scan an authorized source URL or upload a TXT, HTML, PDF, DOCX, or ZIP file above to extract email swipes.
           </EmptyState>
         ) : (
           <div className="overflow-x-auto">
@@ -173,6 +195,11 @@ export default function OfferDetailPage() {
                       <div className="font-mono text-[11px] text-slate-400" title={a.sha256}>
                         sha256: {a.sha256.slice(0, 12)}…
                       </div>
+                      {a.retrieval_url && (
+                        <div className="max-w-xs truncate font-mono text-[11px] text-slate-500" title={a.retrieval_url}>
+                          {a.retrieval_url}
+                        </div>
+                      )}
                       {a.extraction_error && (
                         <div className="mt-1 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700" role="alert">
                           {a.extraction_error}
@@ -190,11 +217,7 @@ export default function OfferDetailPage() {
                     <td className="tabular-nums">{a.swipe_count}</td>
                     <td className="whitespace-nowrap text-xs text-slate-500">{formatDateTime(a.retrieved_at)}</td>
                     <td>
-                      <a
-                        href={assetDownloadUrl(a.id)}
-                        className="btn-secondary btn-xs"
-                        download
-                      >
+                      <a href={assetDownloadUrl(a.id)} className="btn-secondary btn-xs" download>
                         Download
                       </a>
                     </td>
@@ -398,7 +421,8 @@ function OfferEditSection({ offer, onSaved }: { offer: Offer; onSaved: (o: Offer
         </Field>
         <div className="flex items-center justify-between pt-1">
           <span className="text-xs text-slate-500">
-            Metrics: {offer.metrics_source ? `${offer.metrics_source} (${formatDateTime(offer.metrics_as_of)})` : 'none recorded'}
+            Metrics:{' '}
+            {offer.metrics_source ? `${offer.metrics_source} (${formatDateTime(offer.metrics_as_of)})` : 'none recorded'}
           </span>
           <button type="submit" className="btn-primary" disabled={saving}>
             {saving ? 'Saving…' : 'Save changes'}
@@ -516,44 +540,47 @@ function SourcesSection({
   sources,
   loading,
   error,
+  activeJob,
+  pollError,
   onRetry,
   onChanged,
+  onScanStarted,
 }: {
   offerId: string;
-  sources: {
-    id: string;
-    url: string;
-    source_type: SourceType;
-    access_state: AccessState;
-    permission_notes: string | null;
-    allowed_hosts: string[];
-    created_at: string;
-  }[];
+  sources: Source[];
   loading: boolean;
   error: string | null;
+  activeJob: JobDetail | null;
+  pollError: string | null;
   onRetry: () => void;
   onChanged: () => void;
+  onScanStarted: (jobId: string) => void;
 }) {
   const toast = useToast();
   const [url, setUrl] = useState('');
   const [sourceType, setSourceType] = useState<SourceType>('affiliate_page');
   const [accessState, setAccessState] = useState<AccessState>('unverified');
+  const [allowedHostsInput, setAllowedHostsInput] = useState('');
   const [permissionNotes, setPermissionNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [formErr, setFormErr] = useState<{ code?: string; message: string; details?: string[] } | null>(null);
+  const [scanTarget, setScanTarget] = useState<Source | null>(null);
 
   const onAdd = async (e: FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
     setFormErr(null);
+    const hosts = parseTags(allowedHostsInput);
     try {
       await api.createSource(offerId, {
         url: url.trim(),
         source_type: sourceType,
         access_state: accessState,
         permission_notes: permissionNotes.trim() || null,
+        allowed_hosts: hosts.length > 0 ? hosts : undefined,
       });
       setUrl('');
+      setAllowedHostsInput('');
       setPermissionNotes('');
       toast.success('Source added.');
       onChanged();
@@ -578,12 +605,13 @@ function SourcesSection({
 
   return (
     <Section
-      title={`Sources (${sources.length})`}
-      actions={<Badge tone="slate">Scanning arrives in Phase 2</Badge>}
+      title={`Sources & Permission-Aware Scanning (${sources.length})`}
+      actions={<Badge tone="indigo">Bounded domain-scoped retrieval</Badge>}
     >
       <p className="mb-3 text-xs text-slate-600">
-        Record authorized affiliate resource pages and asset URLs. Automated scanning arrives in Phase 2; in Phase 1,
-        upload downloaded vendor files directly in the section below.
+        Record authorized affiliate resource pages and asset URLs. Before scanning, preview domain scope, access state,
+        and vendor restrictions. Restricted, approval-gated, or forbidden sources cannot be scanned automatically—upload
+        authorized vendor files below instead.
       </p>
 
       <form onSubmit={onAdd} className="mb-4 rounded-md border border-slate-200 bg-slate-50/70 p-3">
@@ -594,7 +622,9 @@ function SourcesSection({
             className="mb-3 rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-900"
           >
             <div className="font-semibold">
-              {formErr.code === 'unsafe_url' ? 'Blocked by SSRF / URL safety policy (422 unsafe_url)' : 'Could not add source'}
+              {formErr.code === 'unsafe_url'
+                ? 'Blocked by SSRF / URL safety policy (422 unsafe_url)'
+                : 'Could not add source'}
             </div>
             <div className="mt-0.5">{formErr.message}</div>
             {formErr.details && formErr.details.length > 0 && (
@@ -649,23 +679,58 @@ function SourcesSection({
             </select>
           </Field>
         </div>
-        <div className="mt-2 flex flex-wrap items-end gap-3">
-          <div className="flex-1">
-            <Field label="Permission notes" htmlFor="source-notes">
-              <input
-                id="source-notes"
-                className="input"
-                value={permissionNotes}
-                onChange={(e) => setPermissionNotes(e.target.value)}
-                placeholder="e.g. Approved affiliate tools page; email swipes section"
-              />
-            </Field>
+        <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <Field label="Allowed hosts (comma-separated, optional)" htmlFor="source-hosts">
+            <input
+              id="source-hosts"
+              className="input"
+              value={allowedHostsInput}
+              onChange={(e) => setAllowedHostsInput(e.target.value)}
+              placeholder="vendor.example.com, cdn.example.com"
+            />
+          </Field>
+          <div className="sm:col-span-2 flex flex-wrap items-end gap-3">
+            <div className="flex-1">
+              <Field label="Permission notes" htmlFor="source-notes">
+                <input
+                  id="source-notes"
+                  className="input"
+                  value={permissionNotes}
+                  onChange={(e) => setPermissionNotes(e.target.value)}
+                  placeholder="e.g. Approved affiliate tools page; email swipes section"
+                />
+              </Field>
+            </div>
+            <button type="submit" className="btn-secondary" disabled={submitting}>
+              {submitting ? 'Adding…' : '+ Add source'}
+            </button>
           </div>
-          <button type="submit" className="btn-secondary" disabled={submitting}>
-            {submitting ? 'Adding…' : '+ Add source'}
-          </button>
         </div>
       </form>
+
+      {activeJob && activeJob.type === 'scan_source' && (
+        <div
+          className="mb-4 rounded-md border border-indigo-200 bg-indigo-50/60 p-3 text-sm"
+          data-testid="active-scan-job"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="font-medium text-slate-800">Source scan job</span>
+              <Link to={`/jobs/${activeJob.id}`} className="link font-mono text-xs">
+                {activeJob.id.slice(0, 8)}
+              </Link>
+              <JobStateBadge state={activeJob.state} />
+            </div>
+            <div className="text-xs text-slate-600">
+              Pages: {activeJob.progress.pages_checked ?? 0} · Assets: {activeJob.progress.assets_processed}/
+              {activeJob.progress.assets_found} · Extracted: {activeJob.progress.swipes_extracted} · New:{' '}
+              {activeJob.progress.swipes_new} · Duplicates: {activeJob.progress.duplicates}
+            </div>
+          </div>
+          {activeJob.error_summary && <p className="mt-1 text-xs text-rose-700">{activeJob.error_summary}</p>}
+          {pollError && <p className="mt-1 text-xs text-rose-700">{pollError}</p>}
+        </div>
+      )}
 
       {loading ? (
         <Spinner />
@@ -678,36 +743,175 @@ function SourcesSection({
           <table className="table-base">
             <thead>
               <tr>
-                <th>URL</th>
+                <th>Domain & URL</th>
                 <th>Type</th>
-                <th>Access</th>
+                <th>Access state</th>
                 <th>Allowed hosts</th>
                 <th>Permission notes</th>
-                <th>Added</th>
+                <th>Last checked</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {sources.map((s) => (
-                <tr key={s.id}>
-                  <td className="max-w-md break-all font-mono text-xs">{s.url}</td>
-                  <td>
-                    <Badge>{s.source_type}</Badge>
-                  </td>
-                  <td>
-                    <Badge tone={s.access_state === 'authorized' ? 'emerald' : s.access_state === 'forbidden' ? 'rose' : 'slate'}>
-                      {s.access_state}
-                    </Badge>
-                  </td>
-                  <td className="font-mono text-xs">{s.allowed_hosts.join(', ') || '—'}</td>
-                  <td className="text-xs">{s.permission_notes ?? '—'}</td>
-                  <td className="whitespace-nowrap text-xs text-slate-500">{formatDateTime(s.created_at)}</td>
-                </tr>
-              ))}
+              {sources.map((s) => {
+                const blocked = NON_SCANNABLE_ACCESS_STATES.includes(s.access_state);
+                const domain = extractDomain(s.url);
+                return (
+                  <tr key={s.id}>
+                    <td className="max-w-md">
+                      <div className="font-medium text-slate-900">{domain}</div>
+                      <div className="break-all font-mono text-xs text-slate-500">{s.url}</div>
+                    </td>
+                    <td>
+                      <Badge>{s.source_type}</Badge>
+                    </td>
+                    <td>
+                      <AccessStateBadge state={s.access_state} />
+                    </td>
+                    <td className="font-mono text-xs">{s.allowed_hosts.join(', ') || domain}</td>
+                    <td className="text-xs">{s.permission_notes ?? '—'}</td>
+                    <td className="whitespace-nowrap text-xs text-slate-500">
+                      {formatDateTime(s.last_checked_at)}
+                    </td>
+                    <td>
+                      <div className="flex flex-col items-start gap-1">
+                        <button
+                          type="button"
+                          className="btn-secondary btn-xs"
+                          disabled={blocked}
+                          title={
+                            blocked
+                              ? `Cannot scan source in '${s.access_state}' state; upload authorized vendor files manually.`
+                              : 'Preview scope and start permission-aware resource scan'
+                          }
+                          onClick={() => setScanTarget(s)}
+                        >
+                          {s.last_checked_at ? 'Re-scan' : 'Scan resources'}
+                        </button>
+                        {blocked && (
+                          <span className="text-[11px] text-amber-800">
+                            Scan disabled ({s.access_state.replace('_', ' ')})
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
       )}
+
+      <ScanSourceModal
+        source={scanTarget}
+        onClose={() => setScanTarget(null)}
+        onStarted={(jobId) => {
+          setScanTarget(null);
+          onScanStarted(jobId);
+        }}
+      />
     </Section>
+  );
+}
+
+export function ScanSourceModal({
+  source,
+  onClose,
+  onStarted,
+}: {
+  source: Source | null;
+  onClose: () => void;
+  onStarted: (jobId: string) => void;
+}) {
+  const [confirmed, setConfirmed] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setConfirmed(false);
+    setError(null);
+  }, [source?.id]);
+
+  if (!source) return null;
+
+  const domain = extractDomain(source.url);
+  const blocked = NON_SCANNABLE_ACCESS_STATES.includes(source.access_state);
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!confirmed || blocked) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const job = await api.scanSource(source.id, { confirm_authorized: true });
+      onStarted(job.id);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal title="Confirm permission-aware resource scan" open={Boolean(source)} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-3">
+        {error && (
+          <div role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+            {error}
+          </div>
+        )}
+
+        <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
+          <KeyValue
+            items={[
+              ['Domain', <span className="font-semibold">{domain}</span>],
+              ['Source URL', <span className="font-mono text-xs break-all">{source.url}</span>],
+              ['Source type', <Badge>{source.source_type}</Badge>],
+              ['Access status', <AccessStateBadge state={source.access_state} />],
+              [
+                'Allowed hosts',
+                <span className="font-mono text-xs">
+                  {source.allowed_hosts.length > 0 ? source.allowed_hosts.join(', ') : domain}
+                </span>,
+              ],
+              ['Vendor restrictions / notes', source.permission_notes || 'None recorded'],
+              ['Last checked', formatDateTime(source.last_checked_at)],
+            ]}
+          />
+        </div>
+
+        <p className="text-xs text-slate-600">
+          The scanner will restrict navigation to the approved host scope, respect robots directives, rate limits and
+          permission boundaries, and extract candidate email swipes without executing page scripts or bypassing login
+          gates.
+        </p>
+
+        <label className="flex items-start gap-2 rounded-md border border-slate-200 bg-slate-50 p-2.5 text-sm text-slate-800">
+          <input
+            type="checkbox"
+            required
+            checked={confirmed}
+            onChange={(e) => setConfirmed(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>I confirm I am authorized to retrieve and store creative assets from this vendor source</span>
+        </label>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={!confirmed || blocked || submitting}
+          >
+            {submitting ? 'Starting scan…' : 'Start scan'}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -720,20 +924,7 @@ function AssetUploadSection({
 }: {
   offerId: string;
   sources: { id: string; url: string }[];
-  activeJob: {
-    id: string;
-    state: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancel_requested' | 'cancelled';
-    progress: {
-      assets_found: number;
-      assets_processed: number;
-      swipes_extracted: number;
-      swipes_new: number;
-      versions_new: number;
-      duplicates: number;
-      warnings: number;
-    };
-    error_summary: string | null;
-  } | null;
+  activeJob: JobDetail | null;
   pollError: string | null;
   onUploaded: (jobId: string, duplicateAsset: boolean) => void;
 }) {
@@ -774,10 +965,7 @@ function AssetUploadSection({
           </div>
         )}
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <Field
-            label="File (.txt, .html, .pdf, .docx, .zip — max 25 MB) *"
-            htmlFor="asset-file"
-          >
+          <Field label="File (.txt, .html, .pdf, .docx, .zip — max 25 MB) *" htmlFor="asset-file">
             <input
               id="asset-file"
               type="file"
@@ -834,7 +1022,7 @@ function AssetUploadSection({
         </div>
       </form>
 
-      {activeJob && (
+      {activeJob && activeJob.type === 'ingest_asset' && (
         <div
           className="mt-4 rounded-md border border-indigo-200 bg-indigo-50/60 p-3 text-sm"
           data-testid="active-ingest-job"
@@ -853,9 +1041,7 @@ function AssetUploadSection({
               {activeJob.progress.duplicates}
             </div>
           </div>
-          {activeJob.error_summary && (
-            <p className="mt-1 text-xs text-rose-700">{activeJob.error_summary}</p>
-          )}
+          {activeJob.error_summary && <p className="mt-1 text-xs text-rose-700">{activeJob.error_summary}</p>}
           {pollError && <p className="mt-1 text-xs text-rose-700">{pollError}</p>}
         </div>
       )}

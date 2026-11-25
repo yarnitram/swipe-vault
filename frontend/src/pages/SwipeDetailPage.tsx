@@ -1,7 +1,15 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, assetDownloadUrl, errorMessage } from '../api/client';
-import { FLAG_DESCRIPTIONS, type ReviewDecision, type SwipeDetail, type SwipeVersion } from '../api/types';
+import {
+  FLAG_DESCRIPTIONS,
+  type BrandProfile,
+  type ReviewDecision,
+  type SwipeCta,
+  type SwipeDetail,
+  type SwipeSubject,
+  type SwipeVersion,
+} from '../api/types';
 import HtmlPreview from '../components/HtmlPreview';
 import { useToast } from '../components/Toast';
 import {
@@ -12,6 +20,7 @@ import {
   ErrorState,
   Field,
   FlagBadge,
+  Modal,
   PageHeader,
   ReviewBadge,
   Section,
@@ -22,6 +31,7 @@ import { useAsync } from '../lib/useAsync';
 
 export default function SwipeDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const toast = useToast();
   const swipeState = useAsync(() => api.getSwipe(id), [id]);
 
@@ -35,6 +45,8 @@ export default function SwipeDetailPage() {
 
   const [reviewNotes, setReviewNotes] = useState('');
   const [reviewBusy, setReviewBusy] = useState(false);
+
+  const [draftModalOpen, setDraftModalOpen] = useState(false);
 
   useEffect(() => {
     if (!swipeState.data) return;
@@ -55,6 +67,7 @@ export default function SwipeDetailPage() {
     swipe.versions.find((v) => v.id === swipe.current_version_id) ??
     swipe.versions[0];
   const isCurrentVersion = activeVersion?.id === swipe.current_version_id;
+  const isApproved = swipe.review_state === 'approved';
 
   const onSaveMeta = async (e: FormEvent) => {
     e.preventDefault();
@@ -138,7 +151,7 @@ export default function SwipeDetailPage() {
         }
         actions={
           <>
-            { activeVersion && (
+            {activeVersion && (
               <div className="flex items-center gap-2">
                 <label htmlFor="version-select" className="text-xs font-medium text-slate-600">
                   Version:
@@ -158,12 +171,32 @@ export default function SwipeDetailPage() {
                 </select>
               </div>
             )}
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!isApproved}
+              title={
+                isApproved
+                  ? 'Create a brand-specific campaign draft from this approved swipe'
+                  : 'Approve this swipe first before creating a campaign draft (FR-06 / FR-07)'
+              }
+              onClick={() => setDraftModalOpen(true)}
+            >
+              + Create Campaign Draft
+            </button>
             <Link to="/swipes" className="btn-secondary">
               ← Swipe Library
             </Link>
           </>
         }
       />
+
+      {!isApproved && (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900">
+          This swipe is currently <strong>{swipe.review_state.replace('_', ' ')}</strong>. Approve the swipe in the
+          Review panel to unlock <strong>Create Campaign Draft</strong>.
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
@@ -277,11 +310,7 @@ export default function SwipeDetailPage() {
                         {activeVersion.provenance.map((p) => (
                           <tr key={p.id}>
                             <td>
-                              <a
-                                href={assetDownloadUrl(p.asset_id)}
-                                className="link font-medium"
-                                download
-                              >
+                              <a href={assetDownloadUrl(p.asset_id)} className="link font-medium" download>
                                 {p.asset_filename}
                               </a>
                               {p.retrieval_url && (
@@ -305,11 +334,7 @@ export default function SwipeDetailPage() {
                               {formatDateTime(p.retrieved_at)}
                             </td>
                             <td>
-                              <a
-                                href={assetDownloadUrl(p.asset_id)}
-                                className="btn-secondary btn-xs"
-                                download
-                              >
+                              <a href={assetDownloadUrl(p.asset_id)} className="btn-secondary btn-xs" download>
                                 Download
                               </a>
                             </td>
@@ -542,6 +567,212 @@ export default function SwipeDetailPage() {
           </Section>
         </div>
       </div>
+
+      {activeVersion && (
+        <CreateDraftModal
+          open={draftModalOpen}
+          onClose={() => setDraftModalOpen(false)}
+          swipeId={swipe.id}
+          subjects={sortedSubjects}
+          ctas={activeVersion.ctas}
+          onCreated={(draftId) => {
+            setDraftModalOpen(false);
+            toast.success('Campaign draft created.');
+            navigate(`/drafts/${draftId}`);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function CreateDraftModal({
+  open,
+  onClose,
+  swipeId,
+  subjects,
+  ctas,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  swipeId: string;
+  subjects: SwipeSubject[];
+  ctas: SwipeCta[];
+  onCreated: (draftId: string) => void;
+}) {
+  const brands = useAsync(() => (open ? api.listBrands() : Promise.resolve([] as BrandProfile[])), [open]);
+  const [brandId, setBrandId] = useState('');
+  const [subjectPosition, setSubjectPosition] = useState<number>(subjects[0]?.position ?? 0);
+  const [affiliateUrl, setAffiliateUrl] = useState('');
+  const [replaceUrls, setReplaceUrls] = useState<Set<string>>(new Set());
+  const [sequencePosition, setSequencePosition] = useState('');
+  const [suggestedDayOffset, setSuggestedDayOffset] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (brands.data && brands.data.length > 0 && !brandId) {
+      setBrandId(brands.data[0].id);
+    }
+  }, [brands.data, brandId]);
+
+  useEffect(() => {
+    if (subjects.length > 0) setSubjectPosition(subjects[0].position);
+  }, [subjects]);
+
+  const sourceUrls = Array.from(
+    new Set(ctas.map((c) => c.url).filter((u): u is string => Boolean(u))),
+  );
+
+  const toggleUrl = (u: string) => {
+    setReplaceUrls((prev) => {
+      const next = new Set(prev);
+      if (next.has(u)) next.delete(u);
+      else next.add(u);
+      return next;
+    });
+  };
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!brandId) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const draft = await api.createDraft({
+        swipe_id: swipeId,
+        brand_id: brandId,
+        subject_position: subjects.length > 0 ? subjectPosition : undefined,
+        affiliate_url: affiliateUrl.trim() || null,
+        replace_urls: replaceUrls.size > 0 ? Array.from(replaceUrls) : undefined,
+        sequence_position: sequencePosition.trim() ? Number(sequencePosition) : null,
+        suggested_day_offset: suggestedDayOffset.trim() ? Number(suggestedDayOffset) : null,
+      });
+      onCreated(draft.id);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal title="Create campaign draft" open={open} onClose={onClose}>
+      <form onSubmit={onSubmit} className="space-y-3">
+        {error && (
+          <div role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+            {error}
+          </div>
+        )}
+
+        <p className="text-xs text-slate-600">
+          Creates an editable brand-specific campaign draft from this approved swipe. The original vendor swipe remains
+          immutable.
+        </p>
+
+        <Field label="Brand profile *" htmlFor="draft-brand">
+          <select
+            id="draft-brand"
+            className="input"
+            required
+            value={brandId}
+            onChange={(e) => setBrandId(e.target.value)}
+          >
+            {(brands.data ?? []).map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.name} ({b.slug})
+              </option>
+            ))}
+          </select>
+        </Field>
+
+        {subjects.length > 0 && (
+          <Field label="Initial subject variant" htmlFor="draft-subject-variant">
+            <select
+              id="draft-subject-variant"
+              className="input"
+              value={subjectPosition}
+              onChange={(e) => setSubjectPosition(Number(e.target.value))}
+            >
+              {subjects.map((s, idx) => (
+                <option key={s.id} value={s.position}>
+                  #{idx + 1}: {s.subject}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+
+        <Field
+          label="Verified affiliate URL (optional now, required before draft approval)"
+          htmlFor="draft-affiliate-url"
+          hint="Only recognized CTA placeholders and explicitly selected CTA links below are replaced—never unsubscribe or legal links."
+        >
+          <input
+            id="draft-affiliate-url"
+            type="url"
+            className="input"
+            value={affiliateUrl}
+            onChange={(e) => setAffiliateUrl(e.target.value)}
+            placeholder="https://hop.clickbank.net/?affiliate=..."
+          />
+        </Field>
+
+        {sourceUrls.length > 0 && (
+          <div className="rounded-md border border-slate-200 bg-slate-50 p-2.5 text-xs">
+            <div className="mb-1.5 font-semibold text-slate-700">
+              Select specific source CTA URLs to replace with your affiliate link:
+            </div>
+            <div className="space-y-1">
+              {sourceUrls.map((u) => (
+                <label key={u} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={replaceUrls.has(u)}
+                    onChange={() => toggleUrl(u)}
+                  />
+                  <span className="break-all font-mono">{u}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Sequence position (optional)" htmlFor="draft-seq-pos">
+            <input
+              id="draft-seq-pos"
+              type="number"
+              min={1}
+              className="input"
+              value={sequencePosition}
+              onChange={(e) => setSequencePosition(e.target.value)}
+              placeholder="e.g. 1"
+            />
+          </Field>
+          <Field label="Suggested day offset (optional)" htmlFor="draft-day-offset">
+            <input
+              id="draft-day-offset"
+              type="number"
+              min={0}
+              className="input"
+              value={suggestedDayOffset}
+              onChange={(e) => setSuggestedDayOffset(e.target.value)}
+              placeholder="e.g. 0"
+            />
+          </Field>
+        </div>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="btn-primary" disabled={!brandId || submitting}>
+            {submitting ? 'Creating…' : 'Create draft'}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }

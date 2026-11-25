@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   api,
@@ -11,9 +11,12 @@ import {
   request,
   setUnauthorizedHandler,
 } from '../api/client';
-import type { ImportPreviewRow } from '../api/types';
+import type { DraftDetail, ImportPreviewRow, Source } from '../api/types';
 import HtmlPreview, { buildPreviewSrcDoc, PREVIEW_CSP } from '../components/HtmlPreview';
 import ImportPreviewTable from '../components/ImportPreviewTable';
+import { ToastProvider } from '../components/Toast';
+import DraftDetailPage from '../pages/DraftDetailPage';
+import { ScanSourceModal } from '../pages/OfferDetailPage';
 import OverviewPage from '../pages/OverviewPage';
 
 describe('api/client CSRF & error handling', () => {
@@ -247,6 +250,7 @@ describe('OverviewPage render with mocked fetch', () => {
             needs_changes: 4,
             approved: 150,
             assets_total: 63,
+            drafts_total: 7,
             failed_jobs: 1,
             active_jobs: 2,
             last_ingested_at: '2026-11-25T01:30:00Z',
@@ -265,6 +269,7 @@ describe('OverviewPage render with mocked fetch', () => {
                 type: 'ingest_asset',
                 state: 'completed',
                 progress: {
+                  pages_checked: 0,
                   assets_found: 1,
                   assets_processed: 1,
                   swipes_extracted: 5,
@@ -304,7 +309,215 @@ describe('OverviewPage render with mocked fetch', () => {
     expect(screen.getByText('187')).toBeInTheDocument();
     expect(screen.getByText('19')).toBeInTheDocument();
     expect(screen.getByText('150')).toBeInTheDocument();
+    expect(screen.getByText('7')).toBeInTheDocument();
     expect(screen.getByText('MetaboFlex Greens')).toBeInTheDocument();
     expect(screen.getByText(/ingest_asset · abcdef12/)).toBeInTheDocument();
+  });
+});
+
+describe('Phase 2 ScanSourceModal authorization confirmation', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  const sampleSource: Source = {
+    id: 'src-uuid-123',
+    offer_id: 'offer-uuid-1',
+    url: 'https://vendor.example.com/affiliates/swipes',
+    normalized_url: 'https://vendor.example.com/affiliates/swipes',
+    source_type: 'affiliate_page',
+    access_state: 'authorized',
+    permission_notes: 'Approved affiliate tools page',
+    allowed_hosts: ['vendor.example.com'],
+    last_checked_at: null,
+    created_at: '2026-11-25T01:00:00Z',
+  };
+
+  it('requires confirm_authorized checkbox before calling POST /sources/{id}/scan', async () => {
+    const calls: { url: string; body: unknown }[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+      return new Response(
+        JSON.stringify({
+          id: 'job-scan-12345678',
+          offer_id: 'offer-uuid-1',
+          source_id: 'src-uuid-123',
+          type: 'scan_source',
+          state: 'queued',
+          progress: {
+            pages_checked: 0,
+            assets_found: 0,
+            assets_processed: 0,
+            swipes_extracted: 0,
+            swipes_new: 0,
+            versions_new: 0,
+            duplicates: 0,
+            warnings: 0,
+          },
+          attempts: 0,
+          error_summary: null,
+          created_at: '2026-11-25T02:00:00Z',
+          started_at: null,
+          finished_at: null,
+          elapsed_seconds: null,
+          offer_title: 'FitBurn Pro',
+        }),
+        { status: 202, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    const onStarted = vi.fn();
+    const onClose = vi.fn();
+    render(<ScanSourceModal source={sampleSource} onClose={onClose} onStarted={onStarted} />);
+
+    expect(screen.getAllByText('vendor.example.com').length).toBeGreaterThan(0);
+    expect(screen.getByText('Approved affiliate tools page')).toBeInTheDocument();
+
+    const startBtn = screen.getByRole('button', { name: 'Start scan' });
+    expect(startBtn).toBeDisabled();
+    expect(calls).toHaveLength(0);
+
+    const checkbox = screen.getByRole('checkbox', {
+      name: /I confirm I am authorized to retrieve and store creative assets from this vendor source/i,
+    });
+    await userEvent.click(checkbox);
+    expect(startBtn).not.toBeDisabled();
+
+    await userEvent.click(startBtn);
+    await waitFor(() => {
+      expect(onStarted).toHaveBeenCalledWith('job-scan-12345678');
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('/api/v1/sources/src-uuid-123/scan');
+    expect(calls[0].body).toEqual({ confirm_authorized: true });
+  });
+});
+
+describe('Phase 3 DraftDetailPage approval & export gating (AC-11)', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  const makeDraft = (overrides: Partial<DraftDetail> = {}): DraftDetail => ({
+    id: 'draft-uuid-1',
+    swipe_id: 'swipe-uuid-1',
+    swipe_version_id: 'sv-uuid-1',
+    swipe_version_number: 1,
+    offer: {
+      id: 'offer-uuid-1',
+      title: 'FitBurn Pro',
+      vendor_name: 'FitLabs',
+      network_slug: 'clickbank',
+    },
+    brand: {
+      id: 'brand-uuid-1',
+      name: 'MyFitterU',
+      slug: 'myfitteru',
+    },
+    title: 'FitBurn Morning Routine Draft',
+    subject: 'The 30-second morning metabolism habit',
+    preheader: 'Quick morning routine check',
+    affiliate_url: 'https://hop.clickbank.net/?affiliate=myfitteru&vendor=fitburn',
+    body_html:
+      '<p>Read the morning guide: <a href="https://hop.clickbank.net/?affiliate=myfitteru&vendor=fitburn">Click here</a></p><hr><p>Affiliate disclosure: We may earn a commission.</p><p>Sent by MyFitterU. Unsubscribe anytime.</p>',
+    body_text:
+      'Read the morning guide: https://hop.clickbank.net/?affiliate=myfitteru&vendor=fitburn\n\nAffiliate disclosure: We may earn a commission.\nSent by MyFitterU. Unsubscribe anytime.',
+    status: 'editing',
+    version: 2,
+    approved_version: null,
+    approved_at: null,
+    review_checks: {
+      has_affiliate_url: true,
+      affiliate_url_valid: true,
+      has_disclosure: true,
+      has_sender_footer: true,
+      unresolved_placeholders: [],
+      unexpected_hosts: [],
+      claim_flags: [],
+      warnings: [],
+      ready_for_approval: true,
+    },
+    sequence_position: 1,
+    suggested_day_offset: 0,
+    created_at: '2026-11-25T01:00:00Z',
+    updated_at: '2026-11-25T01:30:00Z',
+    available_subjects: ['The 30-second morning metabolism habit', 'Why breakfast timing matters'],
+    source_ctas: [{ text: 'Click here', url: 'https://vendor.example.com/go', placeholder: null }],
+    exports: [],
+    ...overrides,
+  });
+
+  it('disables export and local downloads when draft is in editing state (AC-11), and enables them once approved', async () => {
+    let currentDraft = makeDraft({ status: 'editing', version: 2, approved_version: null });
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/v1/drafts/draft-uuid-1' && (!init?.method || init.method === 'GET')) {
+        return new Response(JSON.stringify(currentDraft), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === '/api/v1/drafts/draft-uuid-1/approve' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        expect(body).toEqual({ version: 2 });
+        currentDraft = makeDraft({
+          status: 'approved',
+          version: 2,
+          approved_version: 2,
+          approved_at: '2026-11-25T02:10:00Z',
+        });
+        return new Response(JSON.stringify(currentDraft), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('Not found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={['/drafts/draft-uuid-1']}>
+        <ToastProvider>
+          <Routes>
+            <Route path="/drafts/:id" element={<DraftDetailPage />} />
+          </Routes>
+        </ToastProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('FitBurn Morning Routine Draft')).toBeInTheDocument();
+    });
+
+    // In editing state: export is locked and download links are not rendered
+    expect(screen.getByTestId('export-locked-msg')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Download HTML' })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Export locked until v2 is approved/i }),
+    ).toBeDisabled();
+
+    // Approve draft v2
+    const approveBtn = screen.getByRole('button', { name: 'Approve Draft v2' });
+    expect(approveBtn).not.toBeDisabled();
+    await userEvent.click(approveBtn);
+
+    // After approval: download links and Listmonk list loader button are enabled
+    await waitFor(() => {
+      expect(screen.getByTestId('draft-approved-banner')).toBeInTheDocument();
+    });
+
+    const htmlDownload = screen.getByRole('link', { name: 'Download HTML' });
+    const txtDownload = screen.getByRole('link', { name: 'Download Plain Text' });
+    expect(htmlDownload).toHaveAttribute('href', '/api/v1/drafts/draft-uuid-1/download?format=html');
+    expect(txtDownload).toHaveAttribute('href', '/api/v1/drafts/draft-uuid-1/download?format=txt');
+
+    const loadListsBtn = screen.getByRole('button', { name: /Load consent-based lists from Listmonk/i });
+    expect(loadListsBtn).not.toBeDisabled();
   });
 });

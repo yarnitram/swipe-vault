@@ -16,7 +16,7 @@ const NAV: NavItem[] = [
   { to: '/offers', label: 'Offers' },
   { to: '/swipes', label: 'Swipe Library' },
   { to: '/review', label: 'Review Queue' },
-  { to: '/drafts', label: 'Drafts', disabled: true, badge: 'Phase 3' },
+  { to: '/drafts', label: 'Drafts' },
   { to: '/jobs', label: 'Jobs' },
   { to: '/settings', label: 'Settings' },
 ];

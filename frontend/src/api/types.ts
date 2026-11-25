@@ -1,4 +1,4 @@
-// TypeScript types mirroring docs/api.md (Phase 0–1 contract).
+// TypeScript types mirroring docs/api.md (Phases 0–3 contract).
 
 export type UUID = string;
 export type ISODateTime = string;
@@ -34,7 +34,7 @@ export interface LoginResponse {
   user: User;
 }
 
-// ---- Health ----
+// ---- Health & Runtime Settings ----
 export interface HealthLive {
   status: 'ok';
 }
@@ -45,6 +45,19 @@ export interface HealthReady {
   redis: 'ok' | 'error';
 }
 
+export interface RuntimeSettings {
+  crawl_delay_seconds: number;
+  crawl_max_pages: number;
+  crawl_max_depth: number;
+  crawl_timeout_seconds: number;
+  download_max_bytes: number;
+  near_duplicate_threshold: number;
+  listmonk_enabled: boolean;
+  listmonk_configured: boolean;
+  listmonk_base_url: string | null;
+  ai_provider: string;
+}
+
 // ---- Overview ----
 export interface OverviewStats {
   offers_total: number;
@@ -53,6 +66,7 @@ export interface OverviewStats {
   needs_changes: number;
   approved: number;
   assets_total: number;
+  drafts_total?: number;
   failed_jobs: number;
   active_jobs: number;
   last_ingested_at: ISODateTime | null;
@@ -179,7 +193,7 @@ export interface ImportCommitResponse {
   skipped: { row_number: number; reason: string }[];
 }
 
-// ---- Sources ----
+// ---- Sources (Phase 2 scanning) ----
 export const SOURCE_TYPES = ['affiliate_page', 'offer_page', 'asset_url', 'other'] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
@@ -191,6 +205,12 @@ export const ACCESS_STATES = [
   'forbidden',
 ] as const;
 export type AccessState = (typeof ACCESS_STATES)[number];
+
+export const NON_SCANNABLE_ACCESS_STATES: readonly AccessState[] = [
+  'restricted',
+  'approval_required',
+  'forbidden',
+];
 
 export interface Source {
   id: UUID;
@@ -220,6 +240,10 @@ export interface SourceUpdate {
   source_type?: SourceType;
 }
 
+export interface SourceScanRequest {
+  confirm_authorized: boolean;
+}
+
 // ---- Assets ----
 export type ExtractionState =
   | 'pending'
@@ -240,6 +264,7 @@ export interface Asset {
   extraction_error: string | null;
   parent_asset_id: UUID | null;
   origin: 'upload' | 'scan' | 'archive_entry';
+  retrieval_url?: string | null;
   version_label: string | null;
   retrieved_at: ISODateTime;
   swipe_count: number;
@@ -263,9 +288,12 @@ export const JOB_STATES = [
 ] as const;
 export type JobState = (typeof JOB_STATES)[number];
 
+export type JobType = 'ingest_asset' | 'scan_source';
+
 export const TERMINAL_JOB_STATES: readonly JobState[] = ['completed', 'partial', 'failed', 'cancelled'];
 
 export interface JobProgress {
+  pages_checked?: number;
   assets_found: number;
   assets_processed: number;
   swipes_extracted: number;
@@ -279,7 +307,7 @@ export interface Job {
   id: UUID;
   offer_id: UUID | null;
   source_id: UUID | null;
-  type: 'ingest_asset';
+  type: JobType;
   state: JobState;
   progress: JobProgress;
   attempts: number;
@@ -304,6 +332,7 @@ export type JobDetail = Job & { events: JobEvent[] };
 export interface JobListParams {
   state?: JobState | '';
   offer_id?: string;
+  type?: JobType | '';
   page?: number;
   page_size?: number;
 }
@@ -461,3 +490,165 @@ export const FLAG_DESCRIPTIONS: Record<string, string> = {
   testimonial: 'Contains possible testimonial/endorsement',
   placeholder_link: 'Contains a placeholder link to replace',
 };
+
+// ---- Brand Profiles (Phase 3 — FR-07) ----
+export interface BrandAffiliateSettings {
+  default_tracking_param?: string | null;
+  allowed_affiliate_hosts?: string[];
+}
+
+export interface BrandProfile {
+  id: UUID;
+  name: string;
+  slug: string;
+  sender_identity_ref: string | null;
+  affiliate_settings_json: BrandAffiliateSettings;
+  disclosure_text: string;
+  footer_template: string;
+  integration_ref: string | null;
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
+}
+
+export interface BrandCreate {
+  name: string;
+  sender_identity_ref?: string | null;
+  affiliate_settings_json?: BrandAffiliateSettings;
+  disclosure_text?: string;
+  footer_template?: string;
+  integration_ref?: string | null;
+}
+
+export type BrandUpdate = Partial<BrandCreate>;
+
+// ---- Campaign Drafts (Phase 3 — FR-07) ----
+export const DRAFT_STATUSES = ['editing', 'approved', 'exported', 'archived'] as const;
+export type DraftStatus = (typeof DRAFT_STATUSES)[number];
+
+export interface DraftReviewChecks {
+  has_affiliate_url: boolean;
+  affiliate_url_valid: boolean;
+  has_disclosure: boolean;
+  has_sender_footer: boolean;
+  unresolved_placeholders: string[];
+  unexpected_hosts: string[];
+  claim_flags: string[];
+  warnings: string[];
+  ready_for_approval: boolean;
+}
+
+export interface DraftOfferRef {
+  id: UUID;
+  title: string;
+  vendor_name: string | null;
+  network_slug: string;
+}
+
+export interface DraftBrandRef {
+  id: UUID;
+  name: string;
+  slug: string;
+}
+
+export interface Draft {
+  id: UUID;
+  swipe_id: UUID;
+  swipe_version_id: UUID;
+  swipe_version_number: number;
+  offer: DraftOfferRef;
+  brand: DraftBrandRef;
+  title: string;
+  subject: string;
+  preheader: string | null;
+  affiliate_url: string | null;
+  body_html: string;
+  body_text: string;
+  status: DraftStatus;
+  version: number;
+  approved_version: number | null;
+  approved_at: ISODateTime | null;
+  review_checks: DraftReviewChecks;
+  sequence_position: number | null;
+  suggested_day_offset: number | null;
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
+}
+
+export interface DraftDetail extends Draft {
+  available_subjects: string[];
+  source_ctas: SwipeCta[];
+  exports: ExportRecord[];
+}
+
+export interface DraftListParams {
+  brand_id?: string;
+  offer_id?: string;
+  status?: DraftStatus | '';
+  page?: number;
+  page_size?: number;
+}
+
+export interface DraftCreate {
+  swipe_id: UUID;
+  brand_id: UUID;
+  subject_position?: number;
+  affiliate_url?: string | null;
+  replace_urls?: string[];
+  sequence_position?: number | null;
+  suggested_day_offset?: number | null;
+}
+
+export interface DraftUpdate {
+  title?: string;
+  subject?: string;
+  preheader?: string | null;
+  body_text?: string;
+  body_html?: string;
+  affiliate_url?: string | null;
+  replace_placeholders?: boolean;
+  replace_urls?: string[];
+  append_brand_footer?: boolean;
+  sequence_position?: number | null;
+  suggested_day_offset?: number | null;
+  status?: 'editing' | 'archived';
+}
+
+export interface DraftApproveRequest {
+  version: number;
+}
+
+// ---- Listmonk Draft Integration (Phase 3 — FR-08) ----
+export type ExportStatus = 'pending' | 'completed' | 'failed' | 'needs_reconciliation';
+
+export interface ExportRecord {
+  id: UUID;
+  draft_id: UUID;
+  draft_version: number;
+  target: 'listmonk' | 'local_download';
+  idempotency_key: string;
+  remote_id: string | null;
+  remote_url: string | null;
+  status: ExportStatus;
+  error_summary: string | null;
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
+}
+
+export interface ListmonkListRef {
+  id: number;
+  name: string;
+  type: string;
+}
+
+export interface ListmonkTestResponse {
+  enabled: boolean;
+  configured: boolean;
+  reachable: boolean;
+  lists: ListmonkListRef[];
+  message: string;
+}
+
+export interface ListmonkExportRequest {
+  list_ids: number[];
+  confirm_unsent_draft: boolean;
+}

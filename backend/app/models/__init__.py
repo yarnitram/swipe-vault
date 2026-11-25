@@ -46,7 +46,10 @@ ASSET_ORIGINS = ("upload", "scan", "archive_entry")
 REVIEW_STATES = ("pending", "needs_changes", "approved", "rejected", "archived")
 JOB_STATES = ("queued", "running", "completed", "partial", "failed", "cancel_requested", "cancelled")
 JOB_TERMINAL_STATES = ("completed", "partial", "failed", "cancelled")
-JOB_TYPES = ("ingest_asset",)
+JOB_TYPES = ("ingest_asset", "scan_source")
+DRAFT_STATUSES = ("editing", "approved", "exported", "archived")
+EXPORT_TARGETS = ("listmonk", "local_download")
+EXPORT_STATUSES = ("pending", "completed", "failed", "needs_reconciliation")
 
 
 def _in(col: str, values: tuple[str, ...]) -> str:
@@ -102,7 +105,9 @@ class Offer(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     network: Mapped[Network] = relationship(lazy="joined")
-    __table_args__ = (CheckConstraint(_in("approval_state", APPROVAL_STATES), name="ck_offers_approval_state"),)
+    __table_args__ = (
+        CheckConstraint(_in("approval_state", APPROVAL_STATES), name="ck_offers_approval_state"),
+    )
 
 
 class OfferApproval(Base):
@@ -286,6 +291,76 @@ class ReviewEvent(Base):
     created_at: Mapped[datetime] = _ts()
     user: Mapped[User | None] = relationship(lazy="joined")
     __table_args__ = (CheckConstraint(_in("decision", REVIEW_STATES), name="ck_review_events_decision"),)
+
+
+class BrandProfile(Base):
+    __tablename__ = "brand_profiles"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    sender_identity_ref: Mapped[str | None] = mapped_column(String(300))
+    affiliate_settings_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    disclosure_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    footer_template: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    integration_ref: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = _ts()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class Draft(Base):
+    __tablename__ = "drafts"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    swipe_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("swipe_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    brand_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("brand_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    preheader: Mapped[str | None] = mapped_column(Text)
+    affiliate_url: Mapped[str | None] = mapped_column(Text)
+    body_html: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    body_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="editing")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    approved_version: Mapped[int | None] = mapped_column(Integer)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    review_checks_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    sequence_position: Mapped[int | None] = mapped_column(Integer)
+    suggested_day_offset: Mapped[int | None] = mapped_column(Integer)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = _ts()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    swipe_version: Mapped[SwipeVersion] = relationship(lazy="joined")
+    brand: Mapped[BrandProfile] = relationship(lazy="joined")
+    __table_args__ = (
+        CheckConstraint(_in("status", DRAFT_STATUSES), name="ck_drafts_status"),
+        CheckConstraint("version >= 1", name="ck_drafts_version_positive"),
+    )
+
+
+class Export(Base):
+    __tablename__ = "exports"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    draft_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("drafts.id", ondelete="CASCADE"), nullable=False)
+    draft_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    target: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    remote_id: Mapped[str | None] = mapped_column(String(200))
+    remote_url: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = _ts()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        CheckConstraint(_in("target", EXPORT_TARGETS), name="ck_exports_target"),
+        CheckConstraint(_in("status", EXPORT_STATUSES), name="ck_exports_status"),
+    )
 
 
 class Job(Base):

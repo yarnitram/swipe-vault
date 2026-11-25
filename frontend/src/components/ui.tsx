@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import type { ApprovalState, ExtractionState, JobState, ReviewState } from '../api/types';
+import type {
+  AccessState,
+  ApprovalState,
+  DraftStatus,
+  ExportStatus,
+  ExtractionState,
+  JobState,
+  ReviewState,
+} from '../api/types';
 import { FLAG_DESCRIPTIONS } from '../api/types';
 
 export function Spinner({ label = 'Loading…' }: { label?: string }) {
@@ -126,6 +134,37 @@ const extractionTone: Record<ExtractionState, Tone> = {
 };
 export function ExtractionBadge({ state }: { state: ExtractionState }) {
   return <Badge tone={extractionTone[state] ?? 'slate'}>{state.replace('_', ' ')}</Badge>;
+}
+
+const accessTone: Record<AccessState, Tone> = {
+  unverified: 'slate',
+  authorized: 'emerald',
+  restricted: 'amber',
+  approval_required: 'violet',
+  forbidden: 'rose',
+};
+export function AccessStateBadge({ state }: { state: AccessState }) {
+  return <Badge tone={accessTone[state] ?? 'slate'}>{state.replace('_', ' ')}</Badge>;
+}
+
+const draftStatusTone: Record<DraftStatus, Tone> = {
+  editing: 'amber',
+  approved: 'emerald',
+  exported: 'sky',
+  archived: 'slate',
+};
+export function DraftStatusBadge({ status }: { status: DraftStatus }) {
+  return <Badge tone={draftStatusTone[status] ?? 'slate'}>{status}</Badge>;
+}
+
+const exportStatusTone: Record<ExportStatus, Tone> = {
+  pending: 'sky',
+  completed: 'emerald',
+  failed: 'rose',
+  needs_reconciliation: 'amber',
+};
+export function ExportStatusBadge({ status }: { status: ExportStatus }) {
+  return <Badge tone={exportStatusTone[status] ?? 'slate'}>{status.replace('_', ' ')}</Badge>;
 }
 
 export function FlagBadge({ flag }: { flag: string }) {

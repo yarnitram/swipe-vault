@@ -3,12 +3,24 @@ import type {
   ApprovalCreate,
   Asset,
   AssetUploadResponse,
+  BrandCreate,
+  BrandProfile,
+  BrandUpdate,
+  Draft,
+  DraftApproveRequest,
+  DraftCreate,
+  DraftDetail,
+  DraftListParams,
+  DraftUpdate,
+  ExportRecord,
   ImportCommitRequest,
   ImportCommitResponse,
   ImportPreviewResponse,
   Job,
   JobDetail,
   JobListParams,
+  ListmonkExportRequest,
+  ListmonkTestResponse,
   LoginRequest,
   LoginResponse,
   Network,
@@ -18,8 +30,10 @@ import type {
   OfferUpdate,
   OverviewStats,
   Paginated,
+  RuntimeSettings,
   Source,
   SourceCreate,
+  SourceScanRequest,
   SourceUpdate,
   SwipeBulkRequest,
   SwipeBulkResponse,
@@ -191,6 +205,10 @@ export function assetDownloadUrl(assetId: string): string {
   return `${API_BASE}/assets/${encodeURIComponent(assetId)}/download`;
 }
 
+export function getDraftDownloadUrl(draftId: string, format: 'html' | 'txt'): string {
+  return `${API_BASE}/drafts/${encodeURIComponent(draftId)}/download?format=${encodeURIComponent(format)}`;
+}
+
 const enc = encodeURIComponent;
 
 export const api = {
@@ -200,9 +218,10 @@ export const api = {
   logout: () => request<void>('/auth/logout', { method: 'POST', skipAuthRedirect: true }),
   me: () => request<User>('/auth/me', { skipAuthRedirect: true }),
 
-  // Overview / networks
+  // Overview / networks / runtime settings
   overview: () => request<OverviewStats>('/stats/overview'),
   networks: () => request<Network[]>('/networks'),
+  getRuntimeSettings: () => request<RuntimeSettings>('/settings/runtime'),
 
   // Offers
   listOffers: (params: OfferListParams = {}) => request<Paginated<Offer>>('/offers', { query: params }),
@@ -222,12 +241,14 @@ export const api = {
   importCommit: (body: ImportCommitRequest) =>
     request<ImportCommitResponse>('/offers/import/commit', { method: 'POST', json: body }),
 
-  // Sources
+  // Sources & Phase 2 scanning
   listSources: (offerId: string) => request<Source[]>(`/offers/${enc(offerId)}/sources`),
   createSource: (offerId: string, body: SourceCreate) =>
     request<Source>(`/offers/${enc(offerId)}/sources`, { method: 'POST', json: body }),
   updateSource: (id: string, body: SourceUpdate) =>
     request<Source>(`/sources/${enc(id)}`, { method: 'PATCH', json: body }),
+  scanSource: (sourceId: string, body: SourceScanRequest = { confirm_authorized: true }) =>
+    request<Job>(`/sources/${enc(sourceId)}/scan`, { method: 'POST', json: body }),
 
   // Assets
   listAssets: (offerId: string) => request<Asset[]>(`/offers/${enc(offerId)}/assets`),
@@ -258,6 +279,29 @@ export const api = {
   bulkSwipes: (body: SwipeBulkRequest) =>
     request<SwipeBulkResponse>('/swipes/bulk', { method: 'POST', json: body }),
   tags: () => request<Tag[]>('/tags'),
+
+  // Brand Profiles (Phase 3)
+  listBrands: () => request<BrandProfile[]>('/brands'),
+  createBrand: (body: BrandCreate) => request<BrandProfile>('/brands', { method: 'POST', json: body }),
+  updateBrand: (id: string, body: BrandUpdate) =>
+    request<BrandProfile>(`/brands/${enc(id)}`, { method: 'PATCH', json: body }),
+
+  // Campaign Drafts (Phase 3)
+  listDrafts: (params: DraftListParams = {}) => request<Paginated<Draft>>('/drafts', { query: params }),
+  createDraft: (body: DraftCreate) => request<Draft>('/drafts', { method: 'POST', json: body }),
+  getDraft: (id: string) => request<DraftDetail>(`/drafts/${enc(id)}`),
+  updateDraft: (id: string, body: DraftUpdate) =>
+    request<DraftDetail>(`/drafts/${enc(id)}`, { method: 'PATCH', json: body }),
+  approveDraft: (id: string, body: DraftApproveRequest) =>
+    request<DraftDetail>(`/drafts/${enc(id)}/approve`, { method: 'POST', json: body }),
+  getDraftDownloadUrl,
+
+  // Listmonk Draft Integration (Phase 3)
+  testListmonkConnection: () =>
+    request<ListmonkTestResponse>('/integrations/listmonk/test', { method: 'POST', json: {} }),
+  exportDraftToListmonk: (draftId: string, body: ListmonkExportRequest) =>
+    request<ExportRecord>(`/drafts/${enc(draftId)}/export/listmonk`, { method: 'POST', json: body }),
+  getExport: (id: string) => request<ExportRecord>(`/exports/${enc(id)}`),
 };
 
 /** Human-readable message for any thrown value. */
