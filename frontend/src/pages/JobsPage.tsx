@@ -122,6 +122,7 @@ export default function JobsPage() {
                   <th>Job</th>
                   <th>Offer</th>
                   <th>State</th>
+                  <th>Pages</th>
                   <th>Assets</th>
                   <th>Swipes (new / dup)</th>
                   <th>Warnings</th>
@@ -156,6 +157,7 @@ export default function JobsPage() {
                     <td>
                       <JobStateBadge state={j.state} />
                     </td>
+                    <td className="tabular-nums">{j.progress.pages_checked ?? 0}</td>
                     <td className="tabular-nums">
                       {j.progress.assets_processed} / {j.progress.assets_found}
                     </td>

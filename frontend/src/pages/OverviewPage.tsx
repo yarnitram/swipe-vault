@@ -29,6 +29,7 @@ function StatsGrid({ stats }: { stats: OverviewStats }) {
       <StatCard label="Pending reviews" value={stats.pending_reviews} to="/review" tone="text-amber-700" />
       <StatCard label="Needs changes" value={stats.needs_changes} to="/swipes?review_state=needs_changes" tone="text-violet-700" />
       <StatCard label="Approved" value={stats.approved} to="/swipes?review_state=approved" tone="text-emerald-700" />
+      <StatCard label="Campaign drafts" value={stats.drafts_total ?? 0} to="/drafts" tone="text-indigo-700" />
       <StatCard label="Assets" value={stats.assets_total} />
       <StatCard label="Active jobs" value={stats.active_jobs} to="/jobs?state=running" tone="text-sky-700" />
       <StatCard label="Failed jobs" value={stats.failed_jobs} to="/jobs?state=failed" tone={stats.failed_jobs ? 'text-rose-700' : undefined} />

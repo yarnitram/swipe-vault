@@ -135,7 +135,8 @@ export default function JobDetailPage() {
         </div>
       )}
 
-      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
+      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
+        <CounterCard label="Pages checked" value={p.pages_checked ?? 0} />
         <CounterCard label="Assets found" value={p.assets_found} />
         <CounterCard label="Assets processed" value={p.assets_processed} />
         <CounterCard label="Swipes extracted" value={p.swipes_extracted} />

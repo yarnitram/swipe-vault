@@ -40,6 +40,7 @@ def _lineage_key_for_filename(filename: str) -> str:
 
 def default_progress() -> dict[str, int]:
     return {
+        "pages_checked": 0,
         "assets_found": 0,
         "assets_processed": 0,
         "swipes_extracted": 0,
@@ -620,3 +621,30 @@ def enqueue_or_run_ingest_job(db: Session, job: Job) -> Job:
         )
         db.commit()
         return execute_ingest_job(db, job.id)
+
+
+def enqueue_or_run_scan_job(db: Session, job: Job) -> Job:
+    """Enqueue a ``scan_source`` job to RQ or execute inline when ``INGEST_INLINE=true``."""
+    from app.adapters.sources.crawler import execute_scan_source_job
+
+    settings = get_settings()
+    if settings.ingest_inline:
+        return execute_scan_source_job(db, job.id)
+    try:
+        from redis import Redis
+        from rq import Queue
+
+        conn = Redis.from_url(settings.redis_url)
+        queue = Queue(settings.rq_queue_name, connection=conn)
+        queue.enqueue("app.workers.tasks.run_scan_job", str(job.id), job_timeout=900)
+        return job
+    except Exception as exc:  # noqa: BLE001
+        log_job_event(
+            db,
+            job,
+            "warning",
+            "queue_fallback_inline",
+            f"Queue unavailable ({exc.__class__.__name__}); executing scan inline",
+        )
+        db.commit()
+        return execute_scan_source_job(db, job.id)

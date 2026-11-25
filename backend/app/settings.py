@@ -29,23 +29,40 @@ class Settings(BaseSettings):
     download_max_bytes: int = 26_214_400
     zip_max_expanded_bytes: int = 104_857_600
     zip_max_entries: int = 200
-    # When true the API processes uploads inline instead of queueing to RQ (tests / no-worker mode).
+    # When true the API processes jobs inline instead of queueing to RQ (tests / no-worker mode).
     ingest_inline: bool = False
 
-    # Retrieval limits (Phase 2 crawler; stored now so configuration is stable)
+    # Retrieval limits (Phase 2 crawler — FR-02)
     crawl_delay_seconds: float = 2.0
     crawl_max_pages: int = 30
     crawl_max_depth: int = 2
     crawl_timeout_seconds: float = 30.0
+    crawl_max_retries: int = 2
+    crawl_max_retry_wait_seconds: float = 15.0
 
     near_duplicate_threshold: float = Field(default=0.90, ge=0.5, le=1.0)
 
+    # Phase 3 Listmonk draft integration (FR-08 — credentials stay in env, never in DB or API responses)
     listmonk_enabled: bool = False
+    listmonk_base_url: str | None = None
+    listmonk_api_username: str | None = None
+    listmonk_api_token: str | None = None
+    listmonk_timeout_seconds: float = 15.0
+
     ai_provider: str = "none"
 
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() == "production"
+
+    @property
+    def listmonk_configured(self) -> bool:
+        return bool(
+            self.listmonk_base_url
+            and self.listmonk_base_url.strip()
+            and self.listmonk_api_username
+            and self.listmonk_api_token
+        )
 
 
 @lru_cache

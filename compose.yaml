@@ -53,6 +53,7 @@ services:
       - ./fixtures:/app/fixtures:ro
       - ./backend/app:/app/app:ro
       - ./backend/tests:/app/tests:ro
+      - ./backend/alembic:/app/alembic:ro
       - ./backend/pyproject.toml:/app/pyproject.toml:ro
     depends_on:
       postgres:
@@ -87,6 +88,7 @@ services:
       - ./fixtures:/app/fixtures:ro
       - ./backend/app:/app/app:ro
       - ./backend/tests:/app/tests:ro
+      - ./backend/alembic:/app/alembic:ro
       - ./backend/pyproject.toml:/app/pyproject.toml:ro
     depends_on:
       postgres:

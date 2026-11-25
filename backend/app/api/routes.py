@@ -1,4 +1,4 @@
-"""FastAPI v1 routes implementing docs/api.md."""
+"""FastAPI v1 routes implementing docs/api.md (Phases 0-3)."""
 
 import re
 import uuid
@@ -12,6 +12,10 @@ from sqlalchemy import Select, desc, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.adapters.extraction.parser import normalize_text
+from app.adapters.listmonk.client import (
+    export_unsent_draft_to_listmonk,
+    test_listmonk_connection,
+)
 from app.auth import (
     authenticate_user,
     clear_user_session,
@@ -25,6 +29,9 @@ from app.models import (
     Asset,
     AssetSource,
     AuditEvent,
+    BrandProfile,
+    Draft,
+    Export,
     Job,
     JobEvent,
     Network,
@@ -42,11 +49,18 @@ from app.models import (
 )
 from app.schemas import (
     ApprovalCreate,
+    BrandCreate,
+    BrandUpdate,
     CsvCommitRequest,
+    DraftApproveRequest,
+    DraftCreate,
+    DraftUpdate,
+    ListmonkExportRequest,
     LoginRequest,
     OfferCreate,
     OfferUpdate,
     SourceCreate,
+    SourceScanRequest,
     SourceUpdate,
     SwipeBulkRequest,
     SwipeReviewRequest,
@@ -54,12 +68,22 @@ from app.schemas import (
     SwipeUpdate,
 )
 from app.security.filetypes import UnsupportedFileError, detect_file_type
+from app.security.html import sanitize_html
 from app.security.urls import UnsafeUrlError, normalize_host_list, validate_source_url
 from app.services.csv_import import commit_csv_rows, preview_csv_bytes
+from app.services.drafts import (
+    apply_targeted_link_replacements,
+    build_initial_draft_content,
+    compute_draft_review_checks,
+    ensure_brand_disclosure_and_footer,
+    render_draft_html,
+    validate_affiliate_url,
+)
 from app.services.ingestion import (
     _lineage_key_for_filename,
     default_progress,
     enqueue_or_run_ingest_job,
+    enqueue_or_run_scan_job,
     log_job_event,
     refresh_swipe_search_document,
     store_or_reuse_asset,
@@ -87,7 +111,7 @@ def _slugify_tag(raw: str) -> tuple[str, str]:
     return slug, label
 
 
-# ---------- Health & Overview ----------
+# ---------- Health, Runtime Settings & Overview ----------
 
 
 @router.get("/health/live")
@@ -118,6 +142,23 @@ def health_ready(db: Session = Depends(get_db)) -> JSONResponse:
     )
 
 
+@router.get("/settings/runtime")
+def get_runtime_settings(_user: User = Depends(require_user)) -> dict[str, Any]:
+    s = get_settings()
+    return {
+        "crawl_delay_seconds": s.crawl_delay_seconds,
+        "crawl_max_pages": s.crawl_max_pages,
+        "crawl_max_depth": s.crawl_max_depth,
+        "crawl_timeout_seconds": s.crawl_timeout_seconds,
+        "download_max_bytes": s.download_max_bytes,
+        "near_duplicate_threshold": s.near_duplicate_threshold,
+        "listmonk_enabled": s.listmonk_enabled,
+        "listmonk_configured": s.listmonk_configured,
+        "listmonk_base_url": s.listmonk_base_url if s.listmonk_base_url else None,
+        "ai_provider": s.ai_provider,
+    }
+
+
 @router.get("/stats/overview")
 def stats_overview(
     _user: User = Depends(require_user),
@@ -135,12 +176,15 @@ def stats_overview(
         db.scalar(select(func.count()).select_from(Swipe).where(Swipe.review_state == "approved")) or 0
     )
     assets_total = db.scalar(select(func.count()).select_from(Asset)) or 0
+    drafts_total = db.scalar(select(func.count()).select_from(Draft)) or 0
     failed_jobs = (
         db.scalar(select(func.count()).select_from(Job).where(Job.state.in_(("failed", "partial")))) or 0
     )
     active_jobs = (
         db.scalar(
-            select(func.count()).select_from(Job).where(Job.state.in_(("queued", "running", "cancel_requested")))
+            select(func.count())
+            .select_from(Job)
+            .where(Job.state.in_(("queued", "running", "cancel_requested")))
         )
         or 0
     )
@@ -152,6 +196,7 @@ def stats_overview(
         "needs_changes": needs_changes,
         "approved": approved,
         "assets_total": assets_total,
+        "drafts_total": drafts_total,
         "failed_jobs": failed_jobs,
         "active_jobs": active_jobs,
         "last_ingested_at": _iso(last_ingested_at),
@@ -537,7 +582,7 @@ def commit_offers_csv(
     return commit_csv_rows(db, rows, user)
 
 
-# ---------- Sources ----------
+# ---------- Sources & Phase 2 Permission-Aware Scanning ----------
 
 
 def _serialize_source(src: Source) -> dict[str, Any]:
@@ -655,6 +700,77 @@ def update_source(
     return _serialize_source(source)
 
 
+@router.post("/sources/{source_id}/scan", status_code=status.HTTP_202_ACCEPTED)
+def start_source_scan(
+    source_id: str,
+    payload: SourceScanRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    sid = _parse_uuid(source_id, "source_id")
+    source = db.get(Source, sid)
+    if source is None:
+        raise ApiError(404, "not_found", "Source not found")
+
+    if not payload.confirm_authorized:
+        raise ApiError(
+            400,
+            "authorization_required",
+            "Explicit confirmation of authorization to retrieve and use vendor resources is required",
+        )
+
+    if source.access_state in ("restricted", "approval_required", "forbidden"):
+        raise ApiError(
+            409,
+            "source_not_scannable",
+            f"Source is marked '{source.access_state}' and cannot be scanned automatically; "
+            "upload vendor-supplied files manually after approval",
+        )
+
+    # Per-offer and per-source job locking to avoid overlapping scans (FR-09)
+    active = db.scalar(
+        select(Job).where(
+            Job.type == "scan_source",
+            Job.state.in_(("queued", "running", "cancel_requested")),
+            or_(Job.source_id == source.id, Job.offer_id == source.offer_id),
+        )
+    )
+    if active is not None:
+        raise ApiError(
+            409,
+            "scan_already_running",
+            "A resource scan is already queued or running for this offer or source",
+            details={"active_job_id": str(active.id)},
+        )
+
+    if source.access_state == "unverified":
+        source.access_state = "authorized"
+
+    job = Job(
+        offer_id=source.offer_id,
+        source_id=source.id,
+        type="scan_source",
+        state="queued",
+        progress_json=default_progress(),
+        created_by=user.id,
+    )
+    db.add(job)
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="source.scan",
+            entity_type="source",
+            entity_id=str(source.id),
+            metadata_json={"offer_id": str(source.offer_id), "url": source.normalized_url},
+        )
+    )
+    db.commit()
+    db.refresh(job)
+
+    job = enqueue_or_run_scan_job(db, job)
+    return _serialize_job(job)
+
+
 # ---------- Assets ----------
 
 
@@ -684,6 +800,7 @@ def _serialize_asset_source(db: Session, asset_source: AssetSource) -> dict[str,
         "extraction_error": asset.extraction_error,
         "parent_asset_id": parent_asset_id,
         "origin": asset_source.origin,
+        "retrieval_url": asset_source.retrieval_url,
         "version_label": asset_source.version_label,
         "retrieved_at": _iso(asset_source.retrieved_at),
         "swipe_count": swipe_count,
@@ -791,7 +908,6 @@ async def upload_offer_asset(
     db.refresh(job)
 
     if duplicate_asset and asset.extraction_state in ("extracted", "needs_review"):
-        # Exact same asset already ingested for this offer+filename -> no duplicate swipes (AC-04)
         prog = default_progress()
         prog["assets_found"] = 1
         prog["assets_processed"] = 1
@@ -835,7 +951,7 @@ def download_asset(
         blob = read_asset_bytes(asset.storage_key)
     except FileNotFoundError as exc:
         raise ApiError(404, "asset_blob_missing", "Stored asset bytes are missing") from exc
-    safe_name = re.sub(r'[^A-Za-z0-9._-]+', "_", asset.filename) or "asset.bin"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", asset.filename) or "asset.bin"
     return Response(
         content=blob,
         media_type=asset.media_type,
@@ -875,6 +991,7 @@ def _serialize_job(job: Job) -> dict[str, Any]:
 def list_jobs(
     state: str | None = None,
     offer_id: str | None = None,
+    type: str | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     _user: User = Depends(require_user),
@@ -886,6 +1003,8 @@ def list_jobs(
     if offer_id:
         oid = _parse_uuid(offer_id, "offer_id")
         stmt = stmt.where(Job.offer_id == oid)
+    if type:
+        stmt = stmt.where(Job.type == type.strip().lower())
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.scalars(
@@ -987,7 +1106,10 @@ def retry_job(
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
-    new_job = enqueue_or_run_ingest_job(db, new_job)
+    if new_job.type == "scan_source":
+        new_job = enqueue_or_run_scan_job(db, new_job)
+    else:
+        new_job = enqueue_or_run_ingest_job(db, new_job)
     return _serialize_job(new_job)
 
 
@@ -1443,6 +1565,587 @@ def list_tags(
         {"id": str(tid), "slug": slug, "label": label, "swipe_count": int(cnt or 0)}
         for tid, slug, label, cnt in rows
     ]
+
+
+# ---------- Brand Profiles (Phase 3 — FR-07) ----------
+
+
+def _serialize_brand(brand: BrandProfile) -> dict[str, Any]:
+    return {
+        "id": str(brand.id),
+        "name": brand.name,
+        "slug": brand.slug,
+        "sender_identity_ref": brand.sender_identity_ref,
+        "affiliate_settings_json": dict(brand.affiliate_settings_json or {}),
+        "disclosure_text": brand.disclosure_text,
+        "footer_template": brand.footer_template,
+        "integration_ref": brand.integration_ref,
+        "created_at": _iso(brand.created_at),
+        "updated_at": _iso(brand.updated_at),
+    }
+
+
+@router.get("/brands")
+def list_brands(
+    _user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = db.scalars(select(BrandProfile).order_by(BrandProfile.name.asc())).all()
+    return [_serialize_brand(b) for b in rows]
+
+
+@router.post("/brands", status_code=status.HTTP_201_CREATED)
+def create_brand(
+    payload: BrandCreate,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    name = payload.name.strip()
+    slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:100] or "brand"
+    dup = db.scalar(
+        select(BrandProfile).where(
+            or_(func.lower(BrandProfile.name) == name.lower(), BrandProfile.slug == slug)
+        )
+    )
+    if dup is not None:
+        raise ApiError(409, "duplicate_brand", f"Brand '{name}' already exists")
+
+    brand = BrandProfile(
+        name=name,
+        slug=slug,
+        sender_identity_ref=(payload.sender_identity_ref or "").strip() or None,
+        affiliate_settings_json=payload.affiliate_settings_json,
+        disclosure_text=payload.disclosure_text.strip(),
+        footer_template=payload.footer_template.strip(),
+        integration_ref=(payload.integration_ref or "").strip() or None,
+    )
+    db.add(brand)
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="brand.create",
+            entity_type="brand",
+            entity_id=str(brand.id),
+            metadata_json={"name": brand.name},
+        )
+    )
+    db.commit()
+    db.refresh(brand)
+    return _serialize_brand(brand)
+
+
+@router.patch("/brands/{brand_id}")
+def update_brand(
+    brand_id: str,
+    payload: BrandUpdate,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    bid = _parse_uuid(brand_id, "brand_id")
+    brand = db.get(BrandProfile, bid)
+    if brand is None:
+        raise ApiError(404, "not_found", "Brand profile not found")
+
+    fields = payload.model_dump(exclude_unset=True)
+    if "name" in fields and fields["name"] is not None:
+        name = fields["name"].strip()
+        slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:100] or brand.slug
+        dup = db.scalar(
+            select(BrandProfile).where(
+                BrandProfile.id != brand.id,
+                or_(func.lower(BrandProfile.name) == name.lower(), BrandProfile.slug == slug),
+            )
+        )
+        if dup is not None:
+            raise ApiError(409, "duplicate_brand", f"Brand '{name}' already exists")
+        brand.name = name
+        brand.slug = slug
+    if "sender_identity_ref" in fields:
+        brand.sender_identity_ref = (fields["sender_identity_ref"] or "").strip() or None
+    if "affiliate_settings_json" in fields and fields["affiliate_settings_json"] is not None:
+        brand.affiliate_settings_json = fields["affiliate_settings_json"]
+    if "disclosure_text" in fields and fields["disclosure_text"] is not None:
+        brand.disclosure_text = fields["disclosure_text"].strip()
+    if "footer_template" in fields and fields["footer_template"] is not None:
+        brand.footer_template = fields["footer_template"].strip()
+    if "integration_ref" in fields:
+        brand.integration_ref = (fields["integration_ref"] or "").strip() or None
+
+    brand.updated_at = utcnow()
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="brand.update",
+            entity_type="brand",
+            entity_id=str(brand.id),
+            metadata_json={"updated_fields": sorted(fields.keys())},
+        )
+    )
+    db.commit()
+    db.refresh(brand)
+    return _serialize_brand(brand)
+
+
+# ---------- Campaign Drafts & Listmonk Draft Export (Phase 3 — FR-07, FR-08) ----------
+
+
+def _serialize_export(exp: Export) -> dict[str, Any]:
+    return {
+        "id": str(exp.id),
+        "draft_id": str(exp.draft_id),
+        "draft_version": exp.draft_version,
+        "target": exp.target,
+        "idempotency_key": exp.idempotency_key,
+        "remote_id": exp.remote_id,
+        "remote_url": exp.remote_url,
+        "status": exp.status,
+        "error_summary": exp.error_summary,
+        "created_at": _iso(exp.created_at),
+        "updated_at": _iso(exp.updated_at),
+    }
+
+
+def _serialize_draft(db: Session, draft: Draft, *, include_detail: bool = False) -> dict[str, Any]:
+    ver = draft.swipe_version or db.get(SwipeVersion, draft.swipe_version_id)
+    assert ver is not None
+    swipe = db.get(Swipe, ver.swipe_id)
+    assert swipe is not None
+    offer = swipe.offer or db.get(Offer, swipe.offer_id)
+    assert offer is not None
+    brand = draft.brand or db.get(BrandProfile, draft.brand_id)
+    assert brand is not None
+
+    out: dict[str, Any] = {
+        "id": str(draft.id),
+        "swipe_id": str(swipe.id),
+        "swipe_version_id": str(ver.id),
+        "swipe_version_number": ver.version_number,
+        "offer": {
+            "id": str(offer.id),
+            "title": offer.title,
+            "vendor_name": offer.vendor_name,
+            "network_slug": offer.network.slug,
+        },
+        "brand": {"id": str(brand.id), "name": brand.name, "slug": brand.slug},
+        "title": draft.title,
+        "subject": draft.subject,
+        "preheader": draft.preheader,
+        "affiliate_url": draft.affiliate_url,
+        "body_html": draft.body_html,
+        "body_text": draft.body_text,
+        "status": draft.status,
+        "version": draft.version,
+        "approved_version": draft.approved_version,
+        "approved_at": _iso(draft.approved_at),
+        "review_checks": dict(draft.review_checks_json or {}),
+        "sequence_position": draft.sequence_position,
+        "suggested_day_offset": draft.suggested_day_offset,
+        "created_at": _iso(draft.created_at),
+        "updated_at": _iso(draft.updated_at),
+    }
+    if include_detail:
+        out["available_subjects"] = [sv.subject for sv in ver.subjects]
+        out["source_ctas"] = list(ver.ctas_json or [])
+        exports = db.scalars(
+            select(Export).where(Export.draft_id == draft.id).order_by(Export.created_at.desc())
+        ).all()
+        out["exports"] = [_serialize_export(e) for e in exports]
+    return out
+
+
+@router.get("/drafts")
+def list_drafts(
+    brand_id: str | None = None,
+    offer_id: str | None = None,
+    status: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    _user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    stmt: Select[tuple[Draft]] = (
+        select(Draft)
+        .join(SwipeVersion, SwipeVersion.id == Draft.swipe_version_id)
+        .join(Swipe, Swipe.id == SwipeVersion.swipe_id)
+    )
+    if brand_id:
+        bid = _parse_uuid(brand_id, "brand_id")
+        stmt = stmt.where(Draft.brand_id == bid)
+    if offer_id:
+        oid = _parse_uuid(offer_id, "offer_id")
+        stmt = stmt.where(Swipe.offer_id == oid)
+    if status:
+        stmt = stmt.where(Draft.status == status.strip().lower())
+
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(
+        stmt.order_by(Draft.updated_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    return {
+        "items": [_serialize_draft(db, d) for d in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.post("/drafts", status_code=status.HTTP_201_CREATED)
+def create_draft(
+    payload: DraftCreate,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    sid = _parse_uuid(payload.swipe_id, "swipe_id")
+    bid = _parse_uuid(payload.brand_id, "brand_id")
+    swipe = db.get(Swipe, sid)
+    if swipe is None or swipe.current_version_id is None:
+        raise ApiError(404, "not_found", "Swipe not found")
+    if swipe.review_state != "approved":
+        raise ApiError(
+            409,
+            "swipe_not_approved",
+            "Only approved swipes can be used to create campaign drafts (FR-06/FR-07)",
+        )
+
+    brand = db.get(BrandProfile, bid)
+    if brand is None:
+        raise ApiError(404, "not_found", "Brand profile not found")
+
+    version = db.get(SwipeVersion, swipe.current_version_id)
+    assert version is not None
+
+    clean_aff, aff_valid, aff_err = validate_affiliate_url(payload.affiliate_url)
+    if payload.affiliate_url and not aff_valid:
+        raise ApiError(422, "unsafe_url", f"affiliate_url: {aff_err}")
+
+    subject, body_text, body_html, checks = build_initial_draft_content(
+        version=version,
+        brand=brand,
+        subject_position=payload.subject_position,
+        affiliate_url=clean_aff,
+        replace_urls=payload.replace_urls,
+    )
+
+    draft = Draft(
+        swipe_version_id=version.id,
+        brand_id=brand.id,
+        title=f"{brand.name} — {swipe.title or subject[:80]}"[:500],
+        subject=subject,
+        preheader=version.preheader,
+        affiliate_url=clean_aff,
+        body_text=body_text,
+        body_html=body_html,
+        status="editing",
+        version=1,
+        review_checks_json=checks,
+        sequence_position=payload.sequence_position,
+        suggested_day_offset=payload.suggested_day_offset,
+        created_by=user.id,
+    )
+    db.add(draft)
+    db.flush()
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="draft.create",
+            entity_type="draft",
+            entity_id=str(draft.id),
+            metadata_json={"swipe_id": str(swipe.id), "brand": brand.slug},
+        )
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(db, draft, include_detail=True)
+
+
+@router.get("/drafts/{draft_id}")
+def get_draft(
+    draft_id: str,
+    _user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    did = _parse_uuid(draft_id, "draft_id")
+    draft = db.get(Draft, did)
+    if draft is None:
+        raise ApiError(404, "not_found", "Draft not found")
+    return _serialize_draft(db, draft, include_detail=True)
+
+
+@router.patch("/drafts/{draft_id}")
+def update_draft(
+    draft_id: str,
+    payload: DraftUpdate,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    did = _parse_uuid(draft_id, "draft_id")
+    draft = db.get(Draft, did)
+    if draft is None:
+        raise ApiError(404, "not_found", "Draft not found")
+
+    brand = draft.brand or db.get(BrandProfile, draft.brand_id)
+    assert brand is not None
+
+    fields = payload.model_dump(exclude_unset=True)
+    material_changed = False
+
+    if "affiliate_url" in fields:
+        clean_aff, aff_valid, aff_err = validate_affiliate_url(fields["affiliate_url"])
+        if fields["affiliate_url"] and not aff_valid:
+            raise ApiError(422, "unsafe_url", f"affiliate_url: {aff_err}")
+        if clean_aff != draft.affiliate_url:
+            draft.affiliate_url = clean_aff
+            material_changed = True
+
+    if "title" in fields and fields["title"] is not None:
+        draft.title = fields["title"].strip()
+
+    if "subject" in fields and fields["subject"] is not None:
+        new_subj = fields["subject"].strip()
+        if new_subj != draft.subject:
+            draft.subject = new_subj
+            material_changed = True
+
+    if "preheader" in fields:
+        new_pre = (fields["preheader"] or "").strip() or None
+        if new_pre != draft.preheader:
+            draft.preheader = new_pre
+            material_changed = True
+
+    body_text = (
+        fields["body_text"]
+        if "body_text" in fields and fields["body_text"] is not None
+        else draft.body_text
+    )
+    if payload.replace_placeholders or payload.replace_urls:
+        body_text = apply_targeted_link_replacements(
+            body_text,
+            affiliate_url=draft.affiliate_url,
+            replace_placeholders=payload.replace_placeholders,
+            replace_urls=payload.replace_urls,
+        )
+    if payload.append_brand_footer:
+        body_text = ensure_brand_disclosure_and_footer(body_text, brand)
+
+    if body_text != draft.body_text:
+        draft.body_text = body_text
+        material_changed = True
+
+    if "body_html" in fields and fields["body_html"] is not None and not (
+        payload.replace_placeholders or payload.replace_urls or payload.append_brand_footer
+    ):
+        sanitized = sanitize_html(fields["body_html"])
+        if sanitized != draft.body_html:
+            draft.body_html = sanitized
+            material_changed = True
+    elif material_changed:
+        draft.body_html = render_draft_html(draft.body_text)
+
+    if "sequence_position" in fields:
+        draft.sequence_position = fields["sequence_position"]
+    if "suggested_day_offset" in fields:
+        draft.suggested_day_offset = fields["suggested_day_offset"]
+
+    # Material draft edits increment version and invalidate prior approval (FR-07, AC-11)
+    if material_changed:
+        draft.version = (draft.version or 1) + 1
+        draft.approved_version = None
+        draft.approved_at = None
+        draft.approved_by = None
+        draft.status = "editing"
+    elif "status" in fields and fields["status"] is not None:
+        draft.status = fields["status"]
+        if draft.status == "editing":
+            draft.approved_version = None
+            draft.approved_at = None
+
+    draft.review_checks_json = compute_draft_review_checks(
+        subject=draft.subject,
+        preheader=draft.preheader,
+        body_text=draft.body_text,
+        body_html=draft.body_html,
+        affiliate_url=draft.affiliate_url,
+        brand=brand,
+    )
+    draft.updated_at = utcnow()
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="draft.update",
+            entity_type="draft",
+            entity_id=str(draft.id),
+            metadata_json={"version": draft.version, "material_changed": material_changed},
+        )
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(db, draft, include_detail=True)
+
+
+@router.post("/drafts/{draft_id}/approve")
+def approve_draft(
+    draft_id: str,
+    payload: DraftApproveRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    did = _parse_uuid(draft_id, "draft_id")
+    draft = db.get(Draft, did)
+    if draft is None:
+        raise ApiError(404, "not_found", "Draft not found")
+
+    if payload.version != draft.version:
+        raise ApiError(
+            409,
+            "stale_draft_version",
+            f"Approval request targets version {payload.version}, but current draft is version {draft.version}",
+            details={"current_version": draft.version},
+        )
+
+    brand = draft.brand or db.get(BrandProfile, draft.brand_id)
+    assert brand is not None
+    checks = compute_draft_review_checks(
+        subject=draft.subject,
+        preheader=draft.preheader,
+        body_text=draft.body_text,
+        body_html=draft.body_html,
+        affiliate_url=draft.affiliate_url,
+        brand=brand,
+    )
+    draft.review_checks_json = checks
+    if not checks.get("ready_for_approval"):
+        raise ApiError(
+            422,
+            "draft_checks_failed",
+            "Draft cannot be approved until affiliate link, disclosure, footer, and placeholder checks pass",
+            details=checks,
+        )
+
+    draft.status = "approved"
+    draft.approved_version = draft.version
+    draft.approved_at = utcnow()
+    draft.approved_by = user.id
+    draft.updated_at = utcnow()
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="draft.approve",
+            entity_type="draft",
+            entity_id=str(draft.id),
+            metadata_json={"approved_version": draft.version},
+        )
+    )
+    db.commit()
+    db.refresh(draft)
+    return _serialize_draft(db, draft, include_detail=True)
+
+
+def _require_approved_draft(draft: Draft) -> None:
+    if draft.status not in ("approved", "exported") or draft.approved_version != draft.version:
+        raise ApiError(
+            409,
+            "draft_not_approved",
+            "Draft must be approved at its current version before exporting or downloading (AC-11)",
+            details={"current_version": draft.version, "approved_version": draft.approved_version},
+        )
+
+
+@router.get("/drafts/{draft_id}/download")
+def download_draft(
+    draft_id: str,
+    format: str = Query(default="html"),
+    _user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    did = _parse_uuid(draft_id, "draft_id")
+    draft = db.get(Draft, did)
+    if draft is None:
+        raise ApiError(404, "not_found", "Draft not found")
+    _require_approved_draft(draft)
+
+    fmt = format.strip().lower()
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", draft.title)[:80] or "draft"
+    if fmt == "txt":
+        content = f"Subject: {draft.subject}\nPreheader: {draft.preheader or ''}\n\n{draft.body_text}"
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{slug}_v{draft.version}.txt"'},
+        )
+    html_doc = (
+        f"<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{draft.subject}</title></head>\n"
+        f"<body>\n{draft.body_html}\n</body></html>"
+    )
+    return Response(
+        content=html_doc.encode("utf-8"),
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{slug}_v{draft.version}.html"'},
+    )
+
+
+@router.post("/integrations/listmonk/test")
+def test_listmonk(_user: User = Depends(require_user)) -> dict[str, Any]:
+    return test_listmonk_connection()
+
+
+@router.post("/drafts/{draft_id}/export/listmonk")
+def export_draft_listmonk(
+    draft_id: str,
+    payload: ListmonkExportRequest,
+    user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    did = _parse_uuid(draft_id, "draft_id")
+    draft = db.get(Draft, did)
+    if draft is None:
+        raise ApiError(404, "not_found", "Draft not found")
+    _require_approved_draft(draft)
+
+    if not payload.confirm_unsent_draft:
+        raise ApiError(
+            400,
+            "confirmation_required",
+            "Explicit confirmation to create an unsent Listmonk draft campaign is required",
+        )
+
+    brand = draft.brand or db.get(BrandProfile, draft.brand_id)
+    assert brand is not None
+    export_row = export_unsent_draft_to_listmonk(
+        db,
+        draft=draft,
+        brand=brand,
+        list_ids=payload.list_ids,
+        user=user,
+    )
+    db.add(
+        AuditEvent(
+            user_id=user.id,
+            action="draft.export_listmonk",
+            entity_type="draft",
+            entity_id=str(draft.id),
+            metadata_json={
+                "export_id": str(export_row.id),
+                "draft_version": draft.version,
+                "status": export_row.status,
+                "remote_id": export_row.remote_id,
+            },
+        )
+    )
+    db.commit()
+    return _serialize_export(export_row)
+
+
+@router.get("/exports/{export_id}")
+def get_export(
+    export_id: str,
+    _user: User = Depends(require_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    eid = _parse_uuid(export_id, "export_id")
+    exp = db.get(Export, eid)
+    if exp is None:
+        raise ApiError(404, "not_found", "Export not found")
+    return _serialize_export(exp)
 
 
 __all__ = ["router", "normalize_text"]
